@@ -32,7 +32,13 @@ export default function App() {
   const [stats, setStats] = useState({ kept: 0, removed: 0, saved: 0, skipped: 0 })
 
   const isPremium = user?.product === 'premium'
-  const { status: playerStatus, deviceId, activate } = useSpotifyPlayer(Boolean(user) && isPremium)
+  // Web Playback SDK is desktop-oriented; skip on phones to avoid broken playback
+  const isMobile =
+    typeof navigator !== 'undefined' &&
+    /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+  const { status: playerStatus, deviceId, activate } = useSpotifyPlayer(
+    Boolean(user) && isPremium && !isMobile,
+  )
 
   const boot = useCallback(async () => {
     setError(null)

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  AnimatePresence,
+  animate,
   motion,
   useMotionValue,
   useTransform,
@@ -24,7 +24,14 @@ type Props = {
   onActivatePlayer: () => void
 }
 
-const SWIPE_THRESHOLD = 110
+const SWIPE_THRESHOLD = 100
+
+function isTouchDevice() {
+  return (
+    typeof window !== 'undefined' &&
+    ('ontouchstart' in window || navigator.maxTouchPoints > 0)
+  )
+}
 
 export function SwipeDeck({
   tracks,
@@ -36,51 +43,55 @@ export function SwipeDeck({
   onActivatePlayer,
 }: Props) {
   const [index, setIndex] = useState(0)
-  const [exitX, setExitX] = useState(0)
   const [busy, setBusy] = useState(false)
   const [playing, setPlaying] = useState(false)
-  const [biteLabel, setBiteLabel] = useState<string | null>(null)
+  const [status, setStatus] = useState('Tap play to listen')
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const usingSpotifyRef = useRef(false)
   const playGenRef = useRef(0)
+  const mobile = useRef(isTouchDevice()).current
+
   const x = useMotionValue(0)
-  const rotate = useTransform(x, [-220, 220], [-14, 14])
-  const yesOpacity = useTransform(x, [20, 120], [0, 1])
-  const noOpacity = useTransform(x, [-120, -20], [1, 0])
+  const rotate = useTransform(x, [-280, 280], [-16, 16])
+  const yesOpacity = useTransform(x, [24, 110], [0, 1])
+  const noOpacity = useTransform(x, [-110, -24], [1, 0])
 
   const current = tracks[index] ?? null
+  // On phones, Web Playback SDK is unreliable — prefer preview audio only
+  const canUseSdk = playerReady && Boolean(deviceId) && !mobile
 
-  const stopAudio = useCallback(() => {
+  const killAudio = useCallback(() => {
     playGenRef.current += 1
     if (audioRef.current) {
       audioRef.current.pause()
-      audioRef.current.src = ''
+      audioRef.current.removeAttribute('src')
+      audioRef.current.load()
       audioRef.current = null
     }
     usingSpotifyRef.current = false
     setPlaying(false)
   }, [])
 
-  const playBite = useCallback(
+  const startTrack = useCallback(
     async (track: SwipeTrack) => {
       const gen = ++playGenRef.current
       if (audioRef.current) {
         audioRef.current.pause()
-        audioRef.current.src = ''
         audioRef.current = null
       }
       onActivatePlayer()
+      setStatus('Loading…')
 
-      if (playerReady && deviceId) {
+      if (canUseSdk && deviceId) {
         try {
           await transferAndPlay(deviceId, track.uri)
           if (gen !== playGenRef.current) return
           usingSpotifyRef.current = true
-          setBiteLabel('Spotify')
+          setStatus('Playing')
           setPlaying(true)
           return
         } catch {
-          /* fall through to preview */
+          /* try preview */
         }
       }
 
@@ -91,81 +102,101 @@ export function SwipeDeck({
       if (gen !== playGenRef.current) return
 
       if (!url) {
-        usingSpotifyRef.current = false
-        setBiteLabel('No preview')
+        setStatus('No preview — open in Spotify')
         setPlaying(false)
         return
       }
 
-      const audio = new Audio(url)
+      const audio = new Audio()
+      audio.preload = 'auto'
+      audio.src = url
       audioRef.current = audio
       usingSpotifyRef.current = false
-      setBiteLabel('30s preview')
+
       try {
         await audio.play()
         if (gen !== playGenRef.current) {
           audio.pause()
           return
         }
+        setStatus('Playing')
         setPlaying(true)
         audio.onended = () => {
-          if (gen === playGenRef.current) setPlaying(false)
+          if (gen === playGenRef.current) {
+            setPlaying(false)
+            setStatus('Paused')
+          }
         }
       } catch {
-        if (gen === playGenRef.current) setPlaying(false)
+        if (gen === playGenRef.current) {
+          setPlaying(false)
+          setStatus('Tap play to listen')
+        }
       }
     },
-    [deviceId, onActivatePlayer, playerReady],
+    [canUseSdk, deviceId, onActivatePlayer],
   )
 
   const togglePlay = async () => {
-    if (!current) return
+    if (!current || busy) return
     onActivatePlayer()
 
     if (playing) {
       if (usingSpotifyRef.current) {
-        await pausePlayback()
+        await pausePlayback().catch(() => undefined)
       } else {
         audioRef.current?.pause()
       }
       setPlaying(false)
+      setStatus('Paused')
       return
     }
 
-    // Resume current bite if possible, otherwise start fresh
-    if (usingSpotifyRef.current && playerReady) {
+    // Resume
+    if (usingSpotifyRef.current && canUseSdk) {
       try {
         await resumePlayback(deviceId)
         setPlaying(true)
+        setStatus('Playing')
         return
       } catch {
-        /* restart below */
+        /* restart */
       }
     }
 
-    if (audioRef.current && audioRef.current.src) {
+    if (audioRef.current?.src) {
       try {
         await audioRef.current.play()
         setPlaying(true)
+        setStatus('Playing')
         return
       } catch {
-        /* restart below */
+        /* restart */
       }
     }
 
-    await playBite(current)
+    await startTrack(current)
   }
 
+  // New card: center it. Do NOT autoplay on mobile (blocked without gesture).
   useEffect(() => {
     if (!current) {
       onDone()
       return
     }
     x.set(0)
-    void playBite(current)
+    killAudio()
+    void pausePlayback().catch(() => undefined)
+
+    if (mobile) {
+      setStatus('Tap play to listen')
+      setPlaying(false)
+    } else {
+      void startTrack(current)
+    }
+
     return () => {
-      stopAudio()
-      void pausePlayback()
+      killAudio()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id])
@@ -173,25 +204,30 @@ export function SwipeDeck({
   const commit = async (direction: 'left' | 'right') => {
     if (!current || busy) return
     setBusy(true)
-    setExitX(direction === 'right' ? 480 : -480)
-    stopAudio()
-    void pausePlayback()
+    killAudio()
+    void pausePlayback().catch(() => undefined)
+
+    const flyTo = direction === 'right' ? window.innerWidth * 1.2 : -window.innerWidth * 1.2
+    await animate(x, flyTo, { type: 'spring', stiffness: 280, damping: 28, restDelta: 2 })
 
     try {
       await onSwipe(current, direction)
     } finally {
-      setIndex((i) => i + 1)
-      setExitX(0)
+      // Reset to center BEFORE mounting the next card
       x.set(0)
+      setIndex((i) => i + 1)
       setBusy(false)
     }
   }
 
   const onDragEnd = (_: unknown, info: PanInfo) => {
-    if (info.offset.x > SWIPE_THRESHOLD || info.velocity.x > 700) {
+    if (busy) return
+    if (info.offset.x > SWIPE_THRESHOLD || info.velocity.x > 650) {
       void commit('right')
-    } else if (info.offset.x < -SWIPE_THRESHOLD || info.velocity.x < -700) {
+    } else if (info.offset.x < -SWIPE_THRESHOLD || info.velocity.x < -650) {
       void commit('left')
+    } else {
+      void animate(x, 0, { type: 'spring', stiffness: 400, damping: 28 })
     }
   }
 
@@ -212,55 +248,47 @@ export function SwipeDeck({
     <div className="deck">
       <div className="deck-meta">
         <span className="pill">{remaining} left</span>
-        {biteLabel && <span className="pill muted">{biteLabel}</span>}
+        <span className="pill muted">{status}</span>
       </div>
 
       <div className="deck-stage">
-        {/* Blank stack shadow only — never show the next track’s art while current plays */}
         {index + 1 < tracks.length && <div className="card card-stack" aria-hidden />}
 
-        <AnimatePresence>
-          <motion.article
-            key={current.id}
-            className="card card-front"
-            style={{ x, rotate, touchAction: 'none' }}
-            drag="x"
-            dragConstraints={{ left: 0, right: 0 }}
-            dragElastic={0.92}
-            onDragEnd={onDragEnd}
-            initial={{ scale: 0.94, opacity: 0, y: 28 }}
-            animate={{ scale: 1, opacity: 1, y: 0 }}
-            exit={{ x: exitX, opacity: 0, transition: { duration: 0.22 } }}
-            transition={{ type: 'spring', stiffness: 340, damping: 30 }}
-          >
-            <div className="card-media">
-              {current.imageUrl ? (
-                <img src={current.imageUrl} alt="" draggable={false} />
-              ) : (
-                <div className="card-fallback" />
-              )}
-              <div className="card-scrim" />
-              <motion.div className="hint hint-yes" style={{ opacity: yesOpacity }}>
-                {yesLabel.toUpperCase()}
-              </motion.div>
-              <motion.div className="hint hint-no" style={{ opacity: noOpacity }}>
-                {noLabel.toUpperCase()}
-              </motion.div>
-              <div className="card-copy">
-                <h2>{current.name}</h2>
-                <p>{current.artists}</p>
-                <span className="album">{current.album}</span>
-              </div>
+        <motion.article
+          key={current.id}
+          className="card card-front"
+          style={{ x, rotate, touchAction: 'none' }}
+          drag={busy ? false : 'x'}
+          dragConstraints={{ left: 0, right: 0 }}
+          dragElastic={0.9}
+          onDragEnd={onDragEnd}
+        >
+          <div className="card-media">
+            {current.imageUrl ? (
+              <img src={current.imageUrl} alt="" draggable={false} />
+            ) : (
+              <div className="card-fallback" />
+            )}
+            <div className="card-scrim" />
+            <motion.div className="hint hint-yes" style={{ opacity: yesOpacity }}>
+              {yesLabel.toUpperCase()}
+            </motion.div>
+            <motion.div className="hint hint-no" style={{ opacity: noOpacity }}>
+              {noLabel.toUpperCase()}
+            </motion.div>
+            <div className="card-copy">
+              <h2>{current.name}</h2>
+              <p>{current.artists}</p>
+              <span className="album">{current.album}</span>
             </div>
-          </motion.article>
-        </AnimatePresence>
+          </div>
+        </motion.article>
       </div>
 
       <div className="deck-actions">
         <button
           type="button"
           className="action no"
-          aria-label={noLabel}
           disabled={busy}
           onClick={() => void commit('left')}
         >
@@ -268,16 +296,17 @@ export function SwipeDeck({
         </button>
         <button
           type="button"
-          className="action play"
+          className={`action play ${playing ? 'is-playing' : ''}`}
           aria-label={playing ? 'Pause' : 'Play'}
+          disabled={busy}
           onClick={() => void togglePlay()}
         >
-          {playing ? '❚❚' : '▶'}
+          <span className="play-icon">{playing ? '❚❚' : '▶'}</span>
+          <span className="play-text">{playing ? 'Pause' : 'Play'}</span>
         </button>
         <button
           type="button"
           className="action yes"
-          aria-label={yesLabel}
           disabled={busy}
           onClick={() => void commit('right')}
         >
