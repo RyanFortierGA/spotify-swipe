@@ -417,37 +417,41 @@ export async function removeFromPlaylist(playlistId: string, trackUris: string[]
 }
 
 function toTrackUris(trackIds: string[]): string[] {
-  return trackIds.map((id) => (id.startsWith('spotify:') ? id : `spotify:track:${id}`))
+  return trackIds
+    .filter(Boolean)
+    .map((id) => (id.startsWith('spotify:') ? id : `spotify:track:${id}`))
 }
 
-/** Feb 2026: DELETE /me/library — uris required (JSON body) */
+/** Feb 2026: DELETE /me/library?uris=... */
 export async function removeFromLibrary(trackIds: string[]) {
   for (let i = 0; i < trackIds.length; i += 40) {
     const uris = toTrackUris(trackIds.slice(i, i + 40))
-    await spotifyFetch(`/me/library`, {
-      method: 'DELETE',
-      body: JSON.stringify({ uris }),
-    })
+    if (!uris.length) throw new Error('No track to remove')
+    const q = encodeURIComponent(uris.join(','))
+    await spotifyFetch(`/me/library?uris=${q}`, { method: 'DELETE' })
   }
 }
 
-/** Feb 2026: PUT /me/library — uris required (JSON body) */
+/**
+ * Feb 2026: PUT /me/library
+ * Spotify expects `uris` as a query param (same as DELETE). Body alone is rejected.
+ */
 export async function saveToLibrary(trackIds: string[]) {
   for (let i = 0; i < trackIds.length; i += 40) {
     const uris = toTrackUris(trackIds.slice(i, i + 40))
-    await spotifyFetch(`/me/library`, {
-      method: 'PUT',
-      body: JSON.stringify({ uris }),
-    })
+    if (!uris.length) throw new Error('No track to save')
+    const q = encodeURIComponent(uris.join(','))
+    await spotifyFetch(`/me/library?uris=${q}`, { method: 'PUT' })
   }
 }
 
-/** Feb 2026: GET /me/library/contains */
+/** Feb 2026: GET /me/library/contains?uris=... */
 export async function checkSaved(trackIds: string[]): Promise<boolean[]> {
   const results: boolean[] = []
   for (let i = 0; i < trackIds.length; i += 40) {
     const uris = toTrackUris(trackIds.slice(i, i + 40))
-    const q = uris.map(encodeURIComponent).join(',')
+    if (!uris.length) continue
+    const q = encodeURIComponent(uris.join(','))
     try {
       const flags = await spotifyFetch<boolean[]>(`/me/library/contains?uris=${q}`)
       results.push(...flags)

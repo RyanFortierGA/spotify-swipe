@@ -137,7 +137,9 @@ export default function App() {
 
     if (session.mode === 'discover') {
       if (direction === 'right') {
-        await saveToLibrary([track.id])
+        const id = track.id || track.uri?.replace('spotify:track:', '')
+        if (!id) throw new Error('Track is missing an id — cannot save')
+        await saveToLibrary([id])
         setStats((s) => ({ ...s, saved: s.saved + 1 }))
       } else {
         setStats((s) => ({ ...s, skipped: s.skipped + 1 }))
