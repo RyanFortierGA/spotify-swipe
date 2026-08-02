@@ -1,5 +1,4 @@
 const CLIENT_ID = import.meta.env.VITE_SPOTIFY_CLIENT_ID as string
-const REDIRECT_URI = (import.meta.env.VITE_SPOTIFY_REDIRECT_URI as string) || `${window.location.origin}/callback`
 
 const SCOPES = [
   'user-read-email',
@@ -18,11 +17,17 @@ const SCOPES = [
 
 const TOKEN_KEY = 'swipe_spotify_tokens'
 const VERIFIER_KEY = 'swipe_pkce_verifier'
+const CODE_LOCK_KEY = 'swipe_code_exchanging'
 
 type TokenBundle = {
   accessToken: string
   refreshToken: string
   expiresAt: number
+}
+
+/** Always match the host you're on — must equal the Spotify redirect URI exactly */
+export function getRedirectUri(): string {
+  return `${window.location.origin}/callback`
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
@@ -60,6 +65,7 @@ function storeTokens(bundle: TokenBundle) {
 export function clearTokens() {
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(VERIFIER_KEY)
+  sessionStorage.removeItem(CODE_LOCK_KEY)
 }
 
 export function hasClientId(): boolean {
@@ -78,7 +84,7 @@ export async function beginLogin() {
   const params = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: 'code',
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: getRedirectUri(),
     scope: SCOPES,
     code_challenge_method: 'S256',
     code_challenge: challenge,
@@ -89,14 +95,25 @@ export async function beginLogin() {
 }
 
 export async function exchangeCode(code: string): Promise<TokenBundle> {
+  // Prevent double-exchange (React remount / refresh) with the same one-time code
+  if (sessionStorage.getItem(CODE_LOCK_KEY) === code) {
+    const existing = getStoredTokens()
+    if (existing) return existing
+    throw new Error('Login already in progress — refresh and try again.')
+  }
+  sessionStorage.setItem(CODE_LOCK_KEY, code)
+
   const verifier = localStorage.getItem(VERIFIER_KEY)
-  if (!verifier) throw new Error('Missing PKCE verifier — try logging in again.')
+  if (!verifier) {
+    sessionStorage.removeItem(CODE_LOCK_KEY)
+    throw new Error('Missing PKCE verifier — start login from this same browser, then try again.')
+  }
 
   const body = new URLSearchParams({
     client_id: CLIENT_ID,
     grant_type: 'authorization_code',
     code,
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: getRedirectUri(),
     code_verifier: verifier,
   })
 
@@ -107,6 +124,7 @@ export async function exchangeCode(code: string): Promise<TokenBundle> {
   })
 
   if (!res.ok) {
+    sessionStorage.removeItem(CODE_LOCK_KEY)
     const text = await res.text()
     throw new Error(`Token exchange failed: ${text}`)
   }
@@ -118,6 +136,7 @@ export async function exchangeCode(code: string): Promise<TokenBundle> {
   }
 
   localStorage.removeItem(VERIFIER_KEY)
+  sessionStorage.removeItem(CODE_LOCK_KEY)
 
   const bundle: TokenBundle = {
     accessToken: data.access_token,

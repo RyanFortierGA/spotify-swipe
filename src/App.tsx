@@ -43,12 +43,13 @@ export default function App() {
     if (code && (path === '/callback' || path === '/')) {
       try {
         await exchangeCode(code)
-        window.history.replaceState({}, '', '/')
       } catch (e) {
+        window.history.replaceState({}, '', '/')
         setError(e instanceof Error ? e.message : 'Login failed')
         setScreen('login')
         return
       }
+      window.history.replaceState({}, '', '/')
     }
 
     const token = await getAccessToken()
