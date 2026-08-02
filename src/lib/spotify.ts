@@ -90,7 +90,7 @@ export async function getPlaylists(): Promise<SpotifyPlaylist[]> {
     path = nextPath(page.next)
   }
 
-  return items
+  return items.filter((p): p is SpotifyPlaylist => Boolean(p?.id))
 }
 
 type PlaylistTracksPage = {
@@ -257,4 +257,9 @@ export async function pausePlayback() {
   } catch {
     /* ignore if nothing playing */
   }
+}
+
+export async function resumePlayback(deviceId?: string | null) {
+  const q = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''
+  await spotifyFetch(`/me/player/play${q}`, { method: 'PUT' })
 }

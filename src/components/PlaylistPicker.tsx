@@ -17,7 +17,8 @@ export function PlaylistPicker({ onPick, onBack }: Props) {
     ;(async () => {
       try {
         const data = await getPlaylists()
-        if (alive) setPlaylists(data)
+        // Spotify can return null entries in the items array
+        if (alive) setPlaylists(data.filter((p): p is SpotifyPlaylist => Boolean(p?.id)))
       } catch (e) {
         if (alive) setError(e instanceof Error ? e.message : 'Failed to load playlists')
       } finally {
@@ -41,23 +42,26 @@ export function PlaylistPicker({ onPick, onBack }: Props) {
 
       {loading && <p className="status">Loading playlists…</p>}
       {error && <p className="error">{error}</p>}
+      {!loading && !error && playlists.length === 0 && (
+        <p className="status">No playlists found on this account.</p>
+      )}
 
       <ul className="playlist-list">
-        {playlists.map((pl) => (
-          <li key={pl.id}>
-            <button type="button" className="playlist-row" onClick={() => onPick(pl)}>
-              {pl.images[0]?.url ? (
-                <img src={pl.images[0].url} alt="" />
-              ) : (
-                <div className="playlist-thumb" />
-              )}
-              <span>
-                <strong>{pl.name}</strong>
-                <em>{pl.tracks.total} tracks</em>
-              </span>
-            </button>
-          </li>
-        ))}
+        {playlists.map((pl) => {
+          const cover = pl.images?.[0]?.url
+          const total = pl.tracks?.total
+          return (
+            <li key={pl.id}>
+              <button type="button" className="playlist-row" onClick={() => onPick(pl)}>
+                {cover ? <img src={cover} alt="" /> : <div className="playlist-thumb" />}
+                <span>
+                  <strong>{pl.name || 'Untitled playlist'}</strong>
+                  <em>{typeof total === 'number' ? `${total} tracks` : 'Playlist'}</em>
+                </span>
+              </button>
+            </li>
+          )
+        })}
       </ul>
     </section>
   )

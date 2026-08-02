@@ -7,7 +7,12 @@ import {
   type PanInfo,
 } from 'framer-motion'
 import type { AppMode, SwipeTrack } from '../types'
-import { fetchDeezerPreview, transferAndPlay } from '../lib/spotify'
+import {
+  fetchDeezerPreview,
+  pausePlayback,
+  resumePlayback,
+  transferAndPlay,
+} from '../lib/spotify'
 
 type Props = {
   tracks: SwipeTrack[]
@@ -36,60 +41,120 @@ export function SwipeDeck({
   const [playing, setPlaying] = useState(false)
   const [biteLabel, setBiteLabel] = useState<string | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
+  const usingSpotifyRef = useRef(false)
+  const playGenRef = useRef(0)
   const x = useMotionValue(0)
   const rotate = useTransform(x, [-220, 220], [-14, 14])
   const yesOpacity = useTransform(x, [20, 120], [0, 1])
   const noOpacity = useTransform(x, [-120, -20], [1, 0])
 
   const current = tracks[index] ?? null
-  const next = tracks[index + 1] ?? null
 
   const stopAudio = useCallback(() => {
+    playGenRef.current += 1
     if (audioRef.current) {
       audioRef.current.pause()
       audioRef.current.src = ''
       audioRef.current = null
     }
+    usingSpotifyRef.current = false
     setPlaying(false)
   }, [])
 
   const playBite = useCallback(
     async (track: SwipeTrack) => {
-      stopAudio()
+      const gen = ++playGenRef.current
+      if (audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current.src = ''
+        audioRef.current = null
+      }
       onActivatePlayer()
 
       if (playerReady && deviceId) {
         try {
           await transferAndPlay(deviceId, track.uri)
-          setBiteLabel('Playing via Spotify')
+          if (gen !== playGenRef.current) return
+          usingSpotifyRef.current = true
+          setBiteLabel('Spotify')
           setPlaying(true)
           return
         } catch {
-          /* fall through */
+          /* fall through to preview */
         }
       }
 
+      if (gen !== playGenRef.current) return
+
       let url = track.previewUrl ?? null
       if (!url) url = await fetchDeezerPreview(track.isrc)
+      if (gen !== playGenRef.current) return
+
       if (!url) {
-        setBiteLabel('No preview — open in Spotify')
+        usingSpotifyRef.current = false
+        setBiteLabel('No preview')
         setPlaying(false)
         return
       }
 
       const audio = new Audio(url)
       audioRef.current = audio
+      usingSpotifyRef.current = false
       setBiteLabel('30s preview')
       try {
         await audio.play()
+        if (gen !== playGenRef.current) {
+          audio.pause()
+          return
+        }
         setPlaying(true)
-        audio.onended = () => setPlaying(false)
+        audio.onended = () => {
+          if (gen === playGenRef.current) setPlaying(false)
+        }
       } catch {
-        setPlaying(false)
+        if (gen === playGenRef.current) setPlaying(false)
       }
     },
-    [deviceId, onActivatePlayer, playerReady, stopAudio],
+    [deviceId, onActivatePlayer, playerReady],
   )
+
+  const togglePlay = async () => {
+    if (!current) return
+    onActivatePlayer()
+
+    if (playing) {
+      if (usingSpotifyRef.current) {
+        await pausePlayback()
+      } else {
+        audioRef.current?.pause()
+      }
+      setPlaying(false)
+      return
+    }
+
+    // Resume current bite if possible, otherwise start fresh
+    if (usingSpotifyRef.current && playerReady) {
+      try {
+        await resumePlayback(deviceId)
+        setPlaying(true)
+        return
+      } catch {
+        /* restart below */
+      }
+    }
+
+    if (audioRef.current && audioRef.current.src) {
+      try {
+        await audioRef.current.play()
+        setPlaying(true)
+        return
+      } catch {
+        /* restart below */
+      }
+    }
+
+    await playBite(current)
+  }
 
   useEffect(() => {
     if (!current) {
@@ -100,7 +165,7 @@ export function SwipeDeck({
     void playBite(current)
     return () => {
       stopAudio()
-      // Don't hit Spotify pause API on every card teardown — causes request spam
+      void pausePlayback()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id])
@@ -110,6 +175,7 @@ export function SwipeDeck({
     setBusy(true)
     setExitX(direction === 'right' ? 480 : -480)
     stopAudio()
+    void pausePlayback()
 
     try {
       await onSwipe(current, direction)
@@ -150,11 +216,8 @@ export function SwipeDeck({
       </div>
 
       <div className="deck-stage">
-        {next && (
-          <div className="card card-next" aria-hidden>
-            {next.imageUrl ? <img src={next.imageUrl} alt="" /> : <div className="card-fallback" />}
-          </div>
-        )}
+        {/* Blank stack shadow only — never show the next track’s art while current plays */}
+        {index + 1 < tracks.length && <div className="card card-stack" aria-hidden />}
 
         <AnimatePresence>
           <motion.article
@@ -167,7 +230,7 @@ export function SwipeDeck({
             onDragEnd={onDragEnd}
             initial={{ scale: 0.94, opacity: 0, y: 28 }}
             animate={{ scale: 1, opacity: 1, y: 0 }}
-            exit={{ x: exitX, opacity: 0, transition: { duration: 0.28 } }}
+            exit={{ x: exitX, opacity: 0, transition: { duration: 0.22 } }}
             transition={{ type: 'spring', stiffness: 340, damping: 30 }}
           >
             <div className="card-media">
@@ -206,10 +269,10 @@ export function SwipeDeck({
         <button
           type="button"
           className="action play"
-          aria-label={playing ? 'Replay bite' : 'Play bite'}
-          onClick={() => void playBite(current)}
+          aria-label={playing ? 'Pause' : 'Play'}
+          onClick={() => void togglePlay()}
         >
-          {playing ? '♪' : '▶'}
+          {playing ? '❚❚' : '▶'}
         </button>
         <button
           type="button"
@@ -222,16 +285,14 @@ export function SwipeDeck({
         </button>
       </div>
 
-      {!playerReady && current.isrc && (
-        <a
-          className="open-spotify"
-          href={`https://open.spotify.com/track/${current.id}`}
-          target="_blank"
-          rel="noreferrer"
-        >
-          Open in Spotify
-        </a>
-      )}
+      <a
+        className="open-spotify"
+        href={`https://open.spotify.com/track/${current.id}`}
+        target="_blank"
+        rel="noreferrer"
+      >
+        Open in Spotify
+      </a>
     </div>
   )
 }

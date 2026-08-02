@@ -51,8 +51,8 @@ export type SpotifyTrack = {
 export type SpotifyPlaylist = {
   id: string
   name: string
-  images: SpotifyImage[]
-  tracks: { total: number }
+  images: SpotifyImage[] | null
+  tracks: { total: number } | null
   owner: { display_name: string | null; id: string }
   collaborative: boolean
   public: boolean | null

@@ -347,6 +347,13 @@ code {
   filter: saturate(0.85);
 }
 
+.card-stack {
+  transform: scale(0.96) translateY(8px);
+  opacity: 0.35;
+  background: #151c17;
+  box-shadow: none;
+}
+
 .card-front {
   cursor: grab;
   z-index: 2;
