@@ -26,10 +26,11 @@ async function spotifyFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T
     throw new Error('Session expired — please log in again.')
   }
 
-  if (res.status === 204) return undefined as T
+  // Library mutate (and some other Spotify endpoints) return 200/204 with an empty body.
+  // Calling res.json() on that throws and made successful PUT/DELETE look like failures.
+  const text = await res.text()
 
   if (!res.ok) {
-    const text = await res.text()
     let message = text || `Spotify API error ${res.status}`
     try {
       const parsed = JSON.parse(text) as { error?: { message?: string; status?: number } }
@@ -42,7 +43,8 @@ async function spotifyFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T
     throw new Error(message)
   }
 
-  return res.json() as Promise<T>
+  if (!text) return undefined as T
+  return JSON.parse(text) as T
 }
 
 /** Spotify returns absolute next URLs — normalize to a path we can fetch safely */
@@ -435,39 +437,16 @@ function toTrackUris(trackIds: string[]): string[] {
 }
 
 /**
- * Spotify's /me/library is picky about how `uris` is sent.
- * Try the documented forms until one works.
+ * Feb 2026: PUT/DELETE /me/library — `uris` must be a query param.
+ * JSON body is rejected with "missing required field: uris".
+ * Verified pattern (Myx + Spotify curl): ?uris=encodeURIComponent(uri)
  */
 async function mutateLibrary(method: 'PUT' | 'DELETE', trackIds: string[]) {
   const uris = toTrackUris(trackIds)
   if (!uris.length) throw new Error(method === 'PUT' ? 'No track to save' : 'No track to remove')
 
-  const attempts: Array<() => Promise<unknown>> = [
-    // 1) Query string, unencoded (colons/commas are valid in query values)
-    () => spotifyFetch(`/me/library?uris=${uris.join(',')}`, { method }),
-    // 2) Query string, fully encoded (matches Spotify curl samples)
-    () =>
-      spotifyFetch(`/me/library?uris=${encodeURIComponent(uris.join(','))}`, {
-        method,
-      }),
-    // 3) JSON body
-    () =>
-      spotifyFetch(`/me/library`, {
-        method,
-        body: JSON.stringify({ uris }),
-      }),
-  ]
-
-  let lastError: unknown
-  for (const attempt of attempts) {
-    try {
-      await attempt()
-      return
-    } catch (e) {
-      lastError = e
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error('Library update failed')
+  const q = encodeURIComponent(uris.join(','))
+  await spotifyFetch(`/me/library?uris=${q}`, { method })
 }
 
 /** Feb 2026: DELETE /me/library */
