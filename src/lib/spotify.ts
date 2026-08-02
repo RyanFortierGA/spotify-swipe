@@ -222,33 +222,98 @@ async function getLikedTracksShuffled(): Promise<SwipeTrack[]> {
 
 /**
  * Spotify has no play-count API. Approximate "haven't listened much":
- * pull from the oldest end of liked songs, drop anything in your top tracks /
- * recently played, then shuffle that forgotten pool.
+ * sample random windows from the older half of liked songs, drop warm tracks,
+ * diversify artists, and skip IDs shown in recent sessions.
  */
 async function getLikedTracksForgotten(): Promise<SwipeTrack[]> {
   const probe = await spotifyFetch<{ total: number }>('/me/tracks?limit=1')
   const total = probe.total ?? 0
-  const scanSize = Math.min(Math.max(SESSION_TRACK_CAP * 2, 150), Math.max(total, 0))
-  // Liked songs API is newest-first — high offset ≈ songs you liked longest ago
-  const start = Math.max(0, total - scanSize)
+  if (total === 0) return []
 
-  const [warmIds, rows] = await Promise.all([
-    fetchWarmTrackIds(),
-    fetchLikedWindow(start, scanSize || SESSION_TRACK_CAP),
-  ])
+  const warmIds = await fetchWarmTrackIds()
+  const recentlyShown = loadForgottenSeen()
 
-  const cold = rows.filter((r) => !warmIds.has(r.track.id))
-  cold.sort((a, b) => a.addedAt - b.addedAt)
+  // Older half of the library (newest-first API → high offsets are older likes)
+  const olderHalfStart = Math.floor(total / 2)
+  const windowSize = Math.min(80, Math.max(total - olderHalfStart, 1))
+  const maxStart = Math.max(olderHalfStart, total - windowSize)
 
-  let pool = cold
-  if (pool.length < 30) {
-    const warm = rows
-      .filter((r) => warmIds.has(r.track.id))
-      .sort((a, b) => a.addedAt - b.addedAt)
-    pool = [...cold, ...warm]
+  // Pull 2–3 random windows so re-entry isn't the same slice every time
+  const windows = 3
+  const starts = new Set<number>()
+  for (let i = 0; i < windows; i++) {
+    const span = Math.max(0, maxStart - olderHalfStart)
+    const start = olderHalfStart + (span > 0 ? Math.floor(Math.random() * (span + 1)) : 0)
+    starts.add(start)
+  }
+  // Always include a slice near the very oldest end
+  starts.add(Math.max(0, total - windowSize))
+
+  const byId = new Map<string, { track: SwipeTrack; addedAt: number }>()
+  for (const start of starts) {
+    const rows = await fetchLikedWindow(start, windowSize)
+    for (const row of rows) byId.set(row.track.id, row)
   }
 
-  return shuffle(pool.slice(0, SESSION_TRACK_CAP)).map((r) => r.track)
+  let cold = [...byId.values()].filter(
+    (r) => !warmIds.has(r.track.id) && !recentlyShown.has(r.track.id),
+  )
+
+  // If we've filtered too hard, allow recently-shown back in
+  if (cold.length < 20) {
+    cold = [...byId.values()].filter((r) => !warmIds.has(r.track.id))
+  }
+  if (cold.length < 20) {
+    cold = [...byId.values()]
+  }
+
+  cold.sort((a, b) => a.addedAt - b.addedAt)
+  const diversified = diversifyByArtist(
+    shuffle(cold).map((r) => r.track),
+    3,
+  )
+  const session = diversified.slice(0, SESSION_TRACK_CAP)
+
+  rememberForgottenSeen(session.map((t) => t.id))
+  return shuffle(session)
+}
+
+const FORGOTTEN_SEEN_KEY = 'swipe_forgotten_seen'
+const FORGOTTEN_SEEN_MAX = 250
+
+function loadForgottenSeen(): Set<string> {
+  try {
+    const raw = localStorage.getItem(FORGOTTEN_SEEN_KEY)
+    if (!raw) return new Set()
+    const ids = JSON.parse(raw) as string[]
+    return new Set(Array.isArray(ids) ? ids : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function rememberForgottenSeen(ids: string[]) {
+  try {
+    const prev = [...loadForgottenSeen()]
+    const next = [...ids, ...prev.filter((id) => !ids.includes(id))].slice(0, FORGOTTEN_SEEN_MAX)
+    localStorage.setItem(FORGOTTEN_SEEN_KEY, JSON.stringify(next))
+  } catch {
+    /* ignore quota */
+  }
+}
+
+/** Cap how many songs per primary artist so one artist can't dominate the deck */
+function diversifyByArtist(tracks: SwipeTrack[], maxPerArtist: number): SwipeTrack[] {
+  const counts = new Map<string, number>()
+  const out: SwipeTrack[] = []
+  for (const track of tracks) {
+    const key = (track.artists.split(',')[0] || track.artists).trim().toLowerCase()
+    const n = counts.get(key) ?? 0
+    if (n >= maxPerArtist) continue
+    counts.set(key, n + 1)
+    out.push(track)
+  }
+  return out
 }
 
 async function fetchWarmTrackIds(): Promise<Set<string>> {
@@ -355,32 +420,29 @@ function toTrackUris(trackIds: string[]): string[] {
   return trackIds.map((id) => (id.startsWith('spotify:') ? id : `spotify:track:${id}`))
 }
 
-/** Feb 2026: DELETE /me/tracks → DELETE /me/library?uris=... */
+/** Feb 2026: DELETE /me/library — uris required (JSON body) */
 export async function removeFromLibrary(trackIds: string[]) {
   for (let i = 0; i < trackIds.length; i += 40) {
     const uris = toTrackUris(trackIds.slice(i, i + 40))
-    const q = uris.map(encodeURIComponent).join(',')
-    await spotifyFetch(`/me/library?uris=${q}`, { method: 'DELETE' })
+    await spotifyFetch(`/me/library`, {
+      method: 'DELETE',
+      body: JSON.stringify({ uris }),
+    })
   }
 }
 
-/** Feb 2026: PUT /me/tracks → PUT /me/library */
+/** Feb 2026: PUT /me/library — uris required (JSON body) */
 export async function saveToLibrary(trackIds: string[]) {
   for (let i = 0; i < trackIds.length; i += 40) {
     const uris = toTrackUris(trackIds.slice(i, i + 40))
-    const q = uris.map(encodeURIComponent).join(',')
-    try {
-      await spotifyFetch(`/me/library?uris=${q}`, { method: 'PUT' })
-    } catch {
-      await spotifyFetch(`/me/library`, {
-        method: 'PUT',
-        body: JSON.stringify({ uris }),
-      })
-    }
+    await spotifyFetch(`/me/library`, {
+      method: 'PUT',
+      body: JSON.stringify({ uris }),
+    })
   }
 }
 
-/** Feb 2026: GET /me/tracks/contains → GET /me/library/contains */
+/** Feb 2026: GET /me/library/contains */
 export async function checkSaved(trackIds: string[]): Promise<boolean[]> {
   const results: boolean[] = []
   for (let i = 0; i < trackIds.length; i += 40) {
@@ -390,8 +452,7 @@ export async function checkSaved(trackIds: string[]): Promise<boolean[]> {
       const flags = await spotifyFetch<boolean[]>(`/me/library/contains?uris=${q}`)
       results.push(...flags)
     } catch {
-      // Legacy fallback for extended-quota apps
-      const ids = trackIds.slice(i, i + 40)
+      const ids = trackIds.slice(i, i + 40).map((id) => id.replace(/^spotify:track:/, ''))
       const flags = await spotifyFetch<boolean[]>(`/me/tracks/contains?ids=${ids.join(',')}`)
       results.push(...flags)
     }
