@@ -7,7 +7,7 @@ import {
   type PanInfo,
 } from 'framer-motion'
 import type { AppMode, SwipeTrack } from '../types'
-import { fetchDeezerPreview, pausePlayback, transferAndPlay } from '../lib/spotify'
+import { fetchDeezerPreview, transferAndPlay } from '../lib/spotify'
 
 type Props = {
   tracks: SwipeTrack[]
@@ -100,7 +100,7 @@ export function SwipeDeck({
     void playBite(current)
     return () => {
       stopAudio()
-      void pausePlayback()
+      // Don't hit Spotify pause API on every card teardown — causes request spam
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id])
@@ -110,7 +110,6 @@ export function SwipeDeck({
     setBusy(true)
     setExitX(direction === 'right' ? 480 : -480)
     stopAudio()
-    void pausePlayback()
 
     try {
       await onSwipe(current, direction)

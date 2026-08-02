@@ -2,19 +2,24 @@ import { getAccessToken, clearTokens } from './auth'
 import type { SpotifyPlaylist, SpotifyTrack, SpotifyUser, SwipeTrack } from '../types'
 
 const API = 'https://api.spotify.com/v1'
+const MAX_PAGES = 20 // hard stop — prevents runaway pagination
+const SESSION_TRACK_CAP = 100
 
-async function spotifyFetch<T>(path: string, init?: RequestInit): Promise<T> {
+async function spotifyFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T> {
   const token = await getAccessToken()
   if (!token) throw new Error('Not authenticated')
 
-  const res = await fetch(`${API}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  })
+  const url = pathOrUrl.startsWith('http') ? pathOrUrl : `${API}${pathOrUrl}`
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${token}`,
+    ...(init?.headers as Record<string, string> | undefined),
+  }
+  if (method !== 'GET' && method !== 'HEAD') {
+    headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
+  }
+
+  const res = await fetch(url, { ...init, headers })
 
   if (res.status === 401) {
     clearTokens()
@@ -29,6 +34,21 @@ async function spotifyFetch<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   return res.json() as Promise<T>
+}
+
+/** Spotify returns absolute next URLs — normalize to a path we can fetch safely */
+function nextPath(next: string | null | undefined): string | null {
+  if (!next) return null
+  try {
+    if (next.startsWith('http')) {
+      const url = new URL(next)
+      const path = url.pathname.replace(/^\/v1/, '') + url.search
+      return path || null
+    }
+    return next
+  } catch {
+    return null
+  }
 }
 
 export function toSwipeTrack(track: SpotifyTrack, playlistUri?: string): SwipeTrack {
@@ -53,11 +73,21 @@ export async function getMe(): Promise<SpotifyUser> {
 export async function getPlaylists(): Promise<SpotifyPlaylist[]> {
   const items: SpotifyPlaylist[] = []
   let path: string | null = '/me/playlists?limit=50'
+  let pages = 0
+  const seen = new Set<string>()
 
-  while (path) {
-    const page: { items: SpotifyPlaylist[]; next: string | null } = await spotifyFetch(path)
-    items.push(...page.items)
-    path = page.next ? page.next.replace(API, '') : null
+  while (path && pages < MAX_PAGES) {
+    if (seen.has(path)) break
+    seen.add(path)
+    pages += 1
+
+    const page = await spotifyFetch<{
+      items: SpotifyPlaylist[]
+      next: string | null
+    }>(path)
+
+    items.push(...(page.items ?? []).filter(Boolean))
+    path = nextPath(page.next)
   }
 
   return items
@@ -70,16 +100,24 @@ type PlaylistTracksPage = {
 
 export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[]> {
   const tracks: SwipeTrack[] = []
-  let path: string | null = `/playlists/${playlistId}/tracks?limit=50&fields=next,items(uri,track(id,uri,name,duration_ms,preview_url,artists(id,name),album(id,name,images),external_ids))`
+  let path: string | null =
+    `/playlists/${playlistId}/tracks?limit=50&fields=next,items(uri,track(id,uri,name,duration_ms,preview_url,artists(id,name),album(id,name,images),external_ids))`
+  let pages = 0
+  const seen = new Set<string>()
 
-  while (path) {
-    const page: PlaylistTracksPage = await spotifyFetch(path)
-    for (const item of page.items) {
+  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
+    if (seen.has(path)) break
+    seen.add(path)
+    pages += 1
+
+    const page = await spotifyFetch<PlaylistTracksPage>(path)
+    for (const item of page.items ?? []) {
       if (item.track?.id) {
         tracks.push(toSwipeTrack(item.track, item.uri))
+        if (tracks.length >= SESSION_TRACK_CAP) break
       }
     }
-    path = page.next ? page.next.replace(API, '') : null
+    path = nextPath(page.next)
   }
 
   return tracks
@@ -93,13 +131,22 @@ type SavedTracksPage = {
 export async function getLikedTracks(): Promise<SwipeTrack[]> {
   const tracks: SwipeTrack[] = []
   let path: string | null = '/me/tracks?limit=50'
+  let pages = 0
+  const seen = new Set<string>()
 
-  while (path) {
-    const page: SavedTracksPage = await spotifyFetch(path)
-    for (const item of page.items) {
-      if (item.track?.id) tracks.push(toSwipeTrack(item.track))
+  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
+    if (seen.has(path)) break
+    seen.add(path)
+    pages += 1
+
+    const page = await spotifyFetch<SavedTracksPage>(path)
+    for (const item of page.items ?? []) {
+      if (item.track?.id) {
+        tracks.push(toSwipeTrack(item.track))
+        if (tracks.length >= SESSION_TRACK_CAP) break
+      }
     }
-    path = page.next ? page.next.replace(API, '') : null
+    path = nextPath(page.next)
   }
 
   return tracks
@@ -113,7 +160,6 @@ export async function removeFromPlaylist(playlistId: string, trackUris: string[]
 }
 
 export async function removeFromLibrary(trackIds: string[]) {
-  // Spotify allows up to 50 ids
   for (let i = 0; i < trackIds.length; i += 50) {
     const chunk = trackIds.slice(i, i + 50)
     await spotifyFetch(`/me/tracks?ids=${chunk.join(',')}`, { method: 'DELETE' })
@@ -142,52 +188,27 @@ type TopArtistsPage = {
 }
 
 export async function getDiscoverTracks(limit = 40, market = 'US'): Promise<SwipeTrack[]> {
-  const top = await spotifyFetch<TopArtistsPage>('/me/top/artists?limit=12&time_range=medium_term')
+  const top = await spotifyFetch<TopArtistsPage>('/me/top/artists?limit=8&time_range=medium_term')
   const artists = top.items
   const candidates = new Map<string, SwipeTrack>()
 
   if (artists.length === 0) return []
 
+  // Top tracks only — keep discover fast (no album fan-out)
   await Promise.all(
     artists.map(async (artist) => {
       try {
         const data = await spotifyFetch<{ tracks: SpotifyTrack[] }>(
-          `/artists/${artist.id}/top-tracks?market=${market}`,
+          `/artists/${artist.id}/top-tracks?market=${encodeURIComponent(market)}`,
         )
-        for (const track of data.tracks) {
+        for (const track of data.tracks ?? []) {
           if (track?.id) candidates.set(track.id, toSwipeTrack(track))
         }
       } catch {
-        // skip artist on failure
+        /* skip artist */
       }
     }),
   )
-
-  for (const artist of artists.slice(0, 5)) {
-    try {
-      const albums = await spotifyFetch<{
-        items: Array<{ id: string }>
-      }>(`/artists/${artist.id}/albums?include_groups=album,single&limit=2&market=${market}`)
-
-      for (const album of albums.items) {
-        const albumTracks = await spotifyFetch<{
-          items: Array<{ id: string }>
-        }>(`/albums/${album.id}/tracks?limit=4&market=${market}`)
-
-        const ids = albumTracks.items.map((t) => t.id).filter(Boolean)
-        if (!ids.length) continue
-
-        const full = await spotifyFetch<{ tracks: Array<SpotifyTrack | null> }>(
-          `/tracks?ids=${ids.join(',')}`,
-        )
-        for (const track of full.tracks) {
-          if (track?.id) candidates.set(track.id, toSwipeTrack(track))
-        }
-      }
-    } catch {
-      /* skip */
-    }
-  }
 
   const ids = [...candidates.keys()]
   if (ids.length === 0) return []
@@ -203,9 +224,10 @@ export async function getDiscoverTracks(limit = 40, market = 'US'): Promise<Swip
   return fresh.slice(0, limit)
 }
 
-/** Deezer preview by ISRC (proxied in dev to avoid CORS) */
+/** Deezer preview by ISRC (dev proxy only — skipped quietly in prod) */
 export async function fetchDeezerPreview(isrc?: string): Promise<string | null> {
   if (!isrc) return null
+  if (!import.meta.env.DEV) return null
   try {
     const res = await fetch(`/deezer/track/isrc:${encodeURIComponent(isrc)}`)
     if (!res.ok) return null
@@ -223,7 +245,7 @@ export async function transferAndPlay(deviceId: string, uri: string) {
     body: JSON.stringify({ device_ids: [deviceId], play: false }),
   }).catch(() => undefined)
 
-  await spotifyFetch(`/me/player/play?device_id=${deviceId}`, {
+  await spotifyFetch(`/me/player/play?device_id=${encodeURIComponent(deviceId)}`, {
     method: 'PUT',
     body: JSON.stringify({ uris: [uri] }),
   })
