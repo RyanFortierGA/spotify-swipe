@@ -416,47 +416,101 @@ export async function removeFromPlaylist(playlistId: string, trackUris: string[]
   }
 }
 
+/** Normalize any track id/uri/url into spotify:track:{base62} */
 function toTrackUris(trackIds: string[]): string[] {
-  return trackIds
-    .filter(Boolean)
-    .map((id) => (id.startsWith('spotify:') ? id : `spotify:track:${id}`))
-}
-
-/** Feb 2026: DELETE /me/library?uris=... */
-export async function removeFromLibrary(trackIds: string[]) {
-  for (let i = 0; i < trackIds.length; i += 40) {
-    const uris = toTrackUris(trackIds.slice(i, i + 40))
-    if (!uris.length) throw new Error('No track to remove')
-    const q = encodeURIComponent(uris.join(','))
-    await spotifyFetch(`/me/library?uris=${q}`, { method: 'DELETE' })
+  const out: string[] = []
+  for (const raw of trackIds) {
+    if (!raw) continue
+    const s = String(raw).trim()
+    const matched =
+      s.match(/spotify:track:([0-9A-Za-z]{22})/)?.[1] ||
+      s.match(/\/track\/([0-9A-Za-z]{22})/)?.[1] ||
+      (/^[0-9A-Za-z]{22}$/.test(s) ? s : null)
+    if (!matched) {
+      throw new Error(`Invalid Spotify track id: "${s}"`)
+    }
+    out.push(`spotify:track:${matched}`)
   }
+  return out
 }
 
 /**
- * Feb 2026: PUT /me/library
- * Spotify expects `uris` as a query param (same as DELETE). Body alone is rejected.
+ * Spotify's /me/library is picky about how `uris` is sent.
+ * Try the documented forms until one works.
  */
-export async function saveToLibrary(trackIds: string[]) {
+async function mutateLibrary(method: 'PUT' | 'DELETE', trackIds: string[]) {
+  const uris = toTrackUris(trackIds)
+  if (!uris.length) throw new Error(method === 'PUT' ? 'No track to save' : 'No track to remove')
+
+  const attempts: Array<() => Promise<unknown>> = [
+    // 1) Query string, unencoded (colons/commas are valid in query values)
+    () => spotifyFetch(`/me/library?uris=${uris.join(',')}`, { method }),
+    // 2) Query string, fully encoded (matches Spotify curl samples)
+    () =>
+      spotifyFetch(`/me/library?uris=${encodeURIComponent(uris.join(','))}`, {
+        method,
+      }),
+    // 3) JSON body
+    () =>
+      spotifyFetch(`/me/library`, {
+        method,
+        body: JSON.stringify({ uris }),
+      }),
+  ]
+
+  let lastError: unknown
+  for (const attempt of attempts) {
+    try {
+      await attempt()
+      return
+    } catch (e) {
+      lastError = e
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Library update failed')
+}
+
+/** Feb 2026: DELETE /me/library */
+export async function removeFromLibrary(trackIds: string[]) {
   for (let i = 0; i < trackIds.length; i += 40) {
-    const uris = toTrackUris(trackIds.slice(i, i + 40))
-    if (!uris.length) throw new Error('No track to save')
-    const q = encodeURIComponent(uris.join(','))
-    await spotifyFetch(`/me/library?uris=${q}`, { method: 'PUT' })
+    await mutateLibrary('DELETE', trackIds.slice(i, i + 40))
   }
 }
 
-/** Feb 2026: GET /me/library/contains?uris=... */
+/** Feb 2026: PUT /me/library */
+export async function saveToLibrary(trackIds: string[]) {
+  for (let i = 0; i < trackIds.length; i += 40) {
+    await mutateLibrary('PUT', trackIds.slice(i, i + 40))
+  }
+}
+
+/** Feb 2026: GET /me/library/contains */
 export async function checkSaved(trackIds: string[]): Promise<boolean[]> {
   const results: boolean[] = []
   for (let i = 0; i < trackIds.length; i += 40) {
-    const uris = toTrackUris(trackIds.slice(i, i + 40))
-    if (!uris.length) continue
-    const q = encodeURIComponent(uris.join(','))
+    const slice = trackIds.slice(i, i + 40).filter(Boolean)
+    if (!slice.length) continue
     try {
-      const flags = await spotifyFetch<boolean[]>(`/me/library/contains?uris=${q}`)
-      results.push(...flags)
+      const uris = toTrackUris(slice)
+      try {
+        const flags = await spotifyFetch<boolean[]>(
+          `/me/library/contains?uris=${uris.join(',')}`,
+        )
+        results.push(...flags)
+      } catch {
+        const flags = await spotifyFetch<boolean[]>(
+          `/me/library/contains?uris=${encodeURIComponent(uris.join(','))}`,
+        )
+        results.push(...flags)
+      }
     } catch {
-      const ids = trackIds.slice(i, i + 40).map((id) => id.replace(/^spotify:track:/, ''))
+      const ids = slice
+        .map((id) => id.match(/([0-9A-Za-z]{22})/)?.[1])
+        .filter((id): id is string => Boolean(id))
+      if (!ids.length) {
+        results.push(...slice.map(() => false))
+        continue
+      }
       const flags = await spotifyFetch<boolean[]>(`/me/tracks/contains?ids=${ids.join(',')}`)
       results.push(...flags)
     }
