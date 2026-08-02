@@ -8,8 +8,9 @@ import {
 } from 'framer-motion'
 import type { AppMode, SwipeTrack } from '../types'
 import {
-  fetchDeezerPreview,
   pausePlayback,
+  playOnAvailableDevice,
+  resolvePreviewUrl,
   resumePlayback,
   transferAndPlay,
 } from '../lib/spotify'
@@ -20,6 +21,7 @@ type Props = {
   deviceId: string | null
   playerReady: boolean
   onSwipe: (track: SwipeTrack, direction: 'left' | 'right') => void | Promise<void>
+  onUndo: (track: SwipeTrack, direction: 'left' | 'right') => void | Promise<void>
   onDone: () => void
   onActivatePlayer: () => void
 }
@@ -39,6 +41,7 @@ export function SwipeDeck({
   deviceId,
   playerReady,
   onSwipe,
+  onUndo,
   onDone,
   onActivatePlayer,
 }: Props) {
@@ -46,9 +49,15 @@ export function SwipeDeck({
   const [busy, setBusy] = useState(false)
   const [playing, setPlaying] = useState(false)
   const [status, setStatus] = useState('Tap play to listen')
+  const [undo, setUndo] = useState<{
+    track: SwipeTrack
+    direction: 'left' | 'right'
+    index: number
+  } | null>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const usingSpotifyRef = useRef(false)
   const playGenRef = useRef(0)
+  const undoTimer = useRef<number | null>(null)
   const mobile = useRef(isTouchDevice()).current
 
   const x = useMotionValue(0)
@@ -57,7 +66,6 @@ export function SwipeDeck({
   const noOpacity = useTransform(x, [-110, -24], [1, 0])
 
   const current = tracks[index] ?? null
-  // On phones, Web Playback SDK is unreliable — prefer preview audio only
   const canUseSdk = playerReady && Boolean(deviceId) && !mobile
 
   const killAudio = useCallback(() => {
@@ -82,27 +90,42 @@ export function SwipeDeck({
       onActivatePlayer()
       setStatus('Loading…')
 
+      // 1) In-browser Spotify SDK (desktop Premium)
       if (canUseSdk && deviceId) {
         try {
           await transferAndPlay(deviceId, track.uri)
           if (gen !== playGenRef.current) return
           usingSpotifyRef.current = true
-          setStatus('Playing')
+          setStatus('Playing on Swipe')
           setPlaying(true)
           return
         } catch {
-          /* try preview */
+          /* continue */
         }
+      }
+
+      // 2) Spotify Connect — plays on your phone's Spotify app if open
+      try {
+        const ok = await playOnAvailableDevice(track.uri)
+        if (gen !== playGenRef.current) return
+        if (ok) {
+          usingSpotifyRef.current = true
+          setStatus('Playing in Spotify app')
+          setPlaying(true)
+          return
+        }
+      } catch {
+        /* continue */
       }
 
       if (gen !== playGenRef.current) return
 
-      let url = track.previewUrl ?? null
-      if (!url) url = await fetchDeezerPreview(track.isrc)
+      // 3) 30s preview (Spotify / Deezer / Apple)
+      const url = await resolvePreviewUrl(track)
       if (gen !== playGenRef.current) return
 
       if (!url) {
-        setStatus('No preview — open in Spotify')
+        setStatus('Open Spotify app, play anything, then tap Play')
         setPlaying(false)
         return
       }
@@ -119,7 +142,7 @@ export function SwipeDeck({
           audio.pause()
           return
         }
-        setStatus('Playing')
+        setStatus('Playing preview')
         setPlaying(true)
         audio.onended = () => {
           if (gen === playGenRef.current) {
@@ -152,8 +175,7 @@ export function SwipeDeck({
       return
     }
 
-    // Resume
-    if (usingSpotifyRef.current && canUseSdk) {
+    if (usingSpotifyRef.current) {
       try {
         await resumePlayback(deviceId)
         setPlaying(true)
@@ -168,7 +190,7 @@ export function SwipeDeck({
       try {
         await audioRef.current.play()
         setPlaying(true)
-        setStatus('Playing')
+        setStatus('Playing preview')
         return
       } catch {
         /* restart */
@@ -178,7 +200,6 @@ export function SwipeDeck({
     await startTrack(current)
   }
 
-  // New card: center it. Do NOT autoplay on mobile (blocked without gesture).
   useEffect(() => {
     if (!current) {
       onDone()
@@ -187,13 +208,8 @@ export function SwipeDeck({
     x.set(0)
     killAudio()
     void pausePlayback().catch(() => undefined)
-
-    if (mobile) {
-      setStatus('Tap play to listen')
-      setPlaying(false)
-    } else {
-      void startTrack(current)
-    }
+    setStatus('Tap play to listen')
+    setPlaying(false)
 
     return () => {
       killAudio()
@@ -201,21 +217,48 @@ export function SwipeDeck({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current?.id])
 
+  useEffect(() => {
+    return () => {
+      if (undoTimer.current) window.clearTimeout(undoTimer.current)
+    }
+  }, [])
+
   const commit = async (direction: 'left' | 'right') => {
     if (!current || busy) return
     setBusy(true)
     killAudio()
     void pausePlayback().catch(() => undefined)
 
+    const undoIndex = index
+    const swiped = current
     const flyTo = direction === 'right' ? window.innerWidth * 1.2 : -window.innerWidth * 1.2
     await animate(x, flyTo, { type: 'spring', stiffness: 280, damping: 28, restDelta: 2 })
 
     try {
-      await onSwipe(current, direction)
+      await onSwipe(swiped, direction)
+      setUndo({ track: swiped, direction, index: undoIndex })
+      if (undoTimer.current) window.clearTimeout(undoTimer.current)
+      undoTimer.current = window.setTimeout(() => setUndo(null), 8000)
     } finally {
-      // Reset to center BEFORE mounting the next card
       x.set(0)
       setIndex((i) => i + 1)
+      setBusy(false)
+    }
+  }
+
+  const handleUndo = async () => {
+    if (!undo || busy) return
+    setBusy(true)
+    try {
+      await onUndo(undo.track, undo.direction)
+      x.set(0)
+      setIndex(undo.index)
+      setUndo(null)
+      if (undoTimer.current) window.clearTimeout(undoTimer.current)
+      setStatus('Undone — tap play')
+    } catch (e) {
+      setStatus(e instanceof Error ? e.message : 'Undo failed')
+    } finally {
       setBusy(false)
     }
   }
@@ -240,6 +283,11 @@ export function SwipeDeck({
       <div className="empty-state">
         <h2>All done</h2>
         <p>You cleared this stack. Pick another mode when you&apos;re ready.</p>
+        {undo && (
+          <button type="button" className="cta" onClick={() => void handleUndo()}>
+            Undo last swipe
+          </button>
+        )}
       </div>
     )
   }
@@ -250,6 +298,13 @@ export function SwipeDeck({
         <span className="pill">{remaining} left</span>
         <span className="pill muted">{status}</span>
       </div>
+
+      {undo && (
+        <button type="button" className="undo-bar" onClick={() => void handleUndo()} disabled={busy}>
+          Undo {undo.direction === 'left' ? noLabel.toLowerCase() : yesLabel.toLowerCase()} —{' '}
+          {undo.track.name}
+        </button>
+      )}
 
       <div className="deck-stage">
         {index + 1 < tracks.length && <div className="card card-stack" aria-hidden />}

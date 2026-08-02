@@ -302,11 +302,22 @@ code {
   padding-bottom: 8px;
 }
 
-.deck-meta {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+.undo-bar {
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 600;
 }
+
+.undo-bar:active {
+  transform: scale(0.99);
+}
+
 
 .pill {
   font-size: 0.75rem;

@@ -224,18 +224,99 @@ export async function getDiscoverTracks(limit = 40, market = 'US'): Promise<Swip
   return fresh.slice(0, limit)
 }
 
-/** Deezer preview by ISRC (dev proxy only — skipped quietly in prod) */
+/** Resolve a playable 30s preview from Spotify, Deezer, or Apple */
+export async function resolvePreviewUrl(track: {
+  name: string
+  artists: string
+  isrc?: string
+  previewUrl?: string | null
+}): Promise<string | null> {
+  if (track.previewUrl) return track.previewUrl
+
+  const deezer = await fetchDeezerPreview(track.isrc)
+  if (deezer) return deezer
+
+  return fetchApplePreview(track.name, track.artists)
+}
+
+/** Deezer by ISRC — try direct API (CORS) then local/dev proxy */
 export async function fetchDeezerPreview(isrc?: string): Promise<string | null> {
   if (!isrc) return null
-  if (!import.meta.env.DEV) return null
+  const paths = [
+    `https://api.deezer.com/track/isrc:${encodeURIComponent(isrc)}`,
+    `/deezer/track/isrc:${encodeURIComponent(isrc)}`,
+  ]
+  for (const url of paths) {
+    try {
+      const res = await fetch(url)
+      if (!res.ok) continue
+      const data = (await res.json()) as { preview?: string; error?: unknown }
+      if (!data.error && data.preview) return data.preview
+    } catch {
+      /* try next */
+    }
+  }
+  return null
+}
+
+/** Apple Music / iTunes search preview (CORS-friendly) */
+export async function fetchApplePreview(name: string, artists: string): Promise<string | null> {
   try {
-    const res = await fetch(`/deezer/track/isrc:${encodeURIComponent(isrc)}`)
+    const term = `${name} ${artists}`.trim()
+    const res = await fetch(
+      `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&entity=song&limit=5`,
+    )
     if (!res.ok) return null
-    const data = (await res.json()) as { preview?: string; error?: unknown }
-    if (data.error) return null
-    return data.preview || null
+    const data = (await res.json()) as {
+      results?: Array<{ trackName?: string; previewUrl?: string }>
+    }
+    const results = data.results ?? []
+    const lower = name.toLowerCase()
+    const exact = results.find(
+      (r) => r.previewUrl && r.trackName?.toLowerCase() === lower,
+    )
+    if (exact?.previewUrl) return exact.previewUrl
+    const partial = results.find(
+      (r) =>
+        r.previewUrl &&
+        (r.trackName?.toLowerCase().includes(lower) ||
+          lower.includes(r.trackName?.toLowerCase() ?? '')),
+    )
+    return partial?.previewUrl ?? results[0]?.previewUrl ?? null
   } catch {
     return null
+  }
+}
+
+export type SpotifyDevice = {
+  id: string | null
+  is_active: boolean
+  name: string
+  type: string
+  is_restricted: boolean
+}
+
+/** Play on an existing Spotify app/device (works on phone if Spotify is open) */
+export async function playOnAvailableDevice(uri: string): Promise<boolean> {
+  try {
+    const data = await spotifyFetch<{ devices: SpotifyDevice[] }>('/me/player/devices')
+    const devices = (data.devices ?? []).filter((d) => d.id && !d.is_restricted)
+    if (!devices.length) return false
+
+    const preferred =
+      devices.find((d) => d.is_active) ||
+      devices.find((d) => /smartphone|phone/i.test(d.type)) ||
+      devices[0]
+
+    if (!preferred.id) return false
+
+    await spotifyFetch(`/me/player/play?device_id=${encodeURIComponent(preferred.id)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ uris: [uri] }),
+    })
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -262,4 +343,11 @@ export async function pausePlayback() {
 export async function resumePlayback(deviceId?: string | null) {
   const q = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : ''
   await spotifyFetch(`/me/player/play${q}`, { method: 'PUT' })
+}
+
+export async function addToPlaylist(playlistId: string, trackUris: string[]) {
+  await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+    method: 'POST',
+    body: JSON.stringify({ uris: trackUris }),
+  })
 }

@@ -17,6 +17,7 @@ import {
   getPlaylistTracks,
   removeFromLibrary,
   removeFromPlaylist,
+  addToPlaylist,
   saveToLibrary,
 } from './lib/spotify'
 import type { AppMode, SpotifyPlaylist, SpotifyUser, SwipeSession, SwipeTrack } from './types'
@@ -154,6 +155,33 @@ export default function App() {
     setStats((s) => ({ ...s, removed: s.removed + 1 }))
   }
 
+  const onUndo = async (track: SwipeTrack, direction: 'left' | 'right') => {
+    if (!session) return
+
+    if (session.mode === 'discover') {
+      if (direction === 'right') {
+        await removeFromLibrary([track.id])
+        setStats((s) => ({ ...s, saved: Math.max(0, s.saved - 1) }))
+      } else {
+        setStats((s) => ({ ...s, skipped: Math.max(0, s.skipped - 1) }))
+      }
+      return
+    }
+
+    if (direction === 'right') {
+      setStats((s) => ({ ...s, kept: Math.max(0, s.kept - 1) }))
+      return
+    }
+
+    // Restore a removed track
+    if (session.mode === 'playlist' && session.playlistId) {
+      await addToPlaylist(session.playlistId, [track.uri])
+    } else if (session.mode === 'library') {
+      await saveToLibrary([track.id])
+    }
+    setStats((s) => ({ ...s, removed: Math.max(0, s.removed - 1) }))
+  }
+
   const logout = () => {
     clearTokens()
     setUser(null)
@@ -238,6 +266,7 @@ export default function App() {
           deviceId={deviceId}
           playerReady={playerStatus === 'ready'}
           onSwipe={onSwipe}
+          onUndo={onUndo}
           onActivatePlayer={() => void activate()}
           onDone={() => setScreen('done')}
         />
