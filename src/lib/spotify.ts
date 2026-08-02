@@ -98,17 +98,19 @@ type PlaylistTracksPage = {
   next: string | null
 }
 
-type SavedTracksPage = {
-  items: Array<{ track: SpotifyTrack }>
-  next: string | null
-  total?: number
+export async function getLikedTracks(
+  sort: 'forgotten' | 'shuffle' = 'forgotten',
+): Promise<SwipeTrack[]> {
+  if (sort === 'shuffle') {
+    return getLikedTracksShuffled()
+  }
+  return getLikedTracksForgotten()
 }
 
-export async function getLikedTracks(): Promise<SwipeTrack[]> {
-  // Probe total so we can start at a random offset (true shuffle feel)
+/** Random window into the library, then shuffled */
+async function getLikedTracksShuffled(): Promise<SwipeTrack[]> {
   const probe = await spotifyFetch<{
     items: Array<{ track: SpotifyTrack }>
-    next: string | null
     total: number
   }>('/me/tracks?limit=1')
   const total = probe.total ?? 0
@@ -116,37 +118,114 @@ export async function getLikedTracks(): Promise<SwipeTrack[]> {
   const maxStart = Math.max(0, total - windowSize)
   const start = maxStart > 0 ? Math.floor(Math.random() * (maxStart + 1)) : 0
 
-  const tracks: SwipeTrack[] = []
-  let path: string | null = `/me/tracks?limit=50&offset=${start}`
+  const tracks = await fetchLikedWindow(start, SESSION_TRACK_CAP)
+  return shuffle(tracks.map((t) => t.track))
+}
+
+/**
+ * Spotify has no play-count API. Approximate "haven't listened much":
+ * pull from the oldest end of liked songs, drop anything in your top tracks /
+ * recently played, then shuffle that forgotten pool.
+ */
+async function getLikedTracksForgotten(): Promise<SwipeTrack[]> {
+  const probe = await spotifyFetch<{ total: number }>('/me/tracks?limit=1')
+  const total = probe.total ?? 0
+  const scanSize = Math.min(Math.max(SESSION_TRACK_CAP * 2, 150), Math.max(total, 0))
+  // Liked songs API is newest-first — high offset ≈ songs you liked longest ago
+  const start = Math.max(0, total - scanSize)
+
+  const [warmIds, rows] = await Promise.all([
+    fetchWarmTrackIds(),
+    fetchLikedWindow(start, scanSize || SESSION_TRACK_CAP),
+  ])
+
+  const cold = rows.filter((r) => !warmIds.has(r.track.id))
+  cold.sort((a, b) => a.addedAt - b.addedAt)
+
+  let pool = cold
+  if (pool.length < 30) {
+    const warm = rows
+      .filter((r) => warmIds.has(r.track.id))
+      .sort((a, b) => a.addedAt - b.addedAt)
+    pool = [...cold, ...warm]
+  }
+
+  return shuffle(pool.slice(0, SESSION_TRACK_CAP)).map((r) => r.track)
+}
+
+async function fetchWarmTrackIds(): Promise<Set<string>> {
+  const ids = new Set<string>()
+
+  const ranges = ['short_term', 'medium_term', 'long_term'] as const
+  await Promise.all(
+    ranges.map(async (range) => {
+      try {
+        const data = await spotifyFetch<{ items: Array<{ id: string }> }>(
+          `/me/top/tracks?limit=50&time_range=${range}`,
+        )
+        for (const t of data.items ?? []) {
+          if (t?.id) ids.add(t.id)
+        }
+      } catch {
+        /* missing scope / empty */
+      }
+    }),
+  )
+
+  try {
+    const recent = await spotifyFetch<{
+      items: Array<{ track: { id: string } | null }>
+    }>('/me/player/recently-played?limit=50')
+    for (const item of recent.items ?? []) {
+      if (item.track?.id) ids.add(item.track.id)
+    }
+  } catch {
+    /* missing scope */
+  }
+
+  return ids
+}
+
+async function fetchLikedWindow(
+  offset: number,
+  limit: number,
+): Promise<Array<{ track: SwipeTrack; addedAt: number }>> {
+  const rows: Array<{ track: SwipeTrack; addedAt: number }> = []
+  let path: string | null = `/me/tracks?limit=50&offset=${Math.max(0, offset)}`
   let pages = 0
   const seen = new Set<string>()
+  const target = offset + limit
 
-  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
+  while (path && pages < MAX_PAGES && rows.length < limit) {
     if (seen.has(path)) break
     seen.add(path)
     pages += 1
 
-    const page = await spotifyFetch<SavedTracksPage>(path)
+    const page = await spotifyFetch<{
+      items: Array<{ added_at: string; track: SpotifyTrack | null }>
+      next: string | null
+    }>(path)
+
     for (const item of page.items ?? []) {
-      if (item.track?.id) {
-        tracks.push(toSwipeTrack(item.track))
-        if (tracks.length >= SESSION_TRACK_CAP) break
-      }
+      if (!item.track?.id) continue
+      const addedAt = Date.parse(item.added_at) || 0
+      rows.push({ track: toSwipeTrack(item.track), addedAt })
+      if (rows.length >= limit) break
     }
+
     path = nextPath(page.next)
-    // Don't wrap past our random window too far — stop if we've left the intended range
-    if (path && start > 0) {
+    if (path) {
       try {
         const u = new URL(path, 'https://api.spotify.com/v1')
-        const offset = Number(u.searchParams.get('offset') || 0)
-        if (offset >= start + SESSION_TRACK_CAP) break
+        const nextOffset = Number(u.searchParams.get('offset') || 0)
+        if (nextOffset >= target) break
       } catch {
         /* ignore */
       }
     }
   }
 
-  return shuffle(tracks)
+  return rows
 }
 
 export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[]> {

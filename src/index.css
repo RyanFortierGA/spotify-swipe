@@ -245,11 +245,26 @@ code {
   margin-bottom: 6px;
 }
 
-.mode-blurb {
-  display: block;
-  margin: 0;
-  font-size: 0.95rem;
+.mode-card-default {
+  border-color: rgba(30, 215, 96, 0.35);
 }
+
+.default-tag {
+  display: inline-block;
+  margin-left: 8px;
+  font-style: normal;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  vertical-align: middle;
+}
+
+.library-sort .mode-header h1 {
+  font-size: 1.6rem;
+}
+
 
 .back {
   color: var(--muted);

@@ -20,7 +20,7 @@ import {
   addToPlaylist,
   saveToLibrary,
 } from './lib/spotify'
-import type { AppMode, SpotifyPlaylist, SpotifyUser, SwipeSession, SwipeTrack } from './types'
+import type { AppMode, LibrarySort, SpotifyPlaylist, SpotifyUser, SwipeSession, SwipeTrack } from './types'
 
 type Screen = 'boot' | 'login' | 'modes' | 'playlists' | 'loading' | 'swipe' | 'done'
 
@@ -80,14 +80,17 @@ export default function App() {
     void boot()
   }, [boot])
 
-  const startMode = (mode: AppMode) => {
+  const startMode = (mode: AppMode, opts?: { librarySort?: LibrarySort }) => {
     setStats({ kept: 0, removed: 0, saved: 0, skipped: 0 })
     if (mode === 'playlist') {
       setSession({ mode })
       setScreen('playlists')
       return
     }
-    void loadTracks({ mode })
+    void loadTracks({
+      mode,
+      librarySort: mode === 'library' ? opts?.librarySort ?? 'forgotten' : undefined,
+    })
   }
 
   const loadTracks = async (next: SwipeSession) => {
@@ -99,12 +102,11 @@ export default function App() {
       if (next.mode === 'playlist' && next.playlistId) {
         list = await getPlaylistTracks(next.playlistId)
       } else if (next.mode === 'library') {
-        list = await getLikedTracks()
+        list = await getLikedTracks(next.librarySort ?? 'forgotten')
       } else if (next.mode === 'discover') {
         list = await getDiscoverTracks(50, user?.country || 'US')
       }
 
-      // Shuffle already applied when fetching playlist/library
       setTracks(list)
       setScreen(list.length ? 'swipe' : 'done')
     } catch (e) {

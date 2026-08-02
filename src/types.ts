@@ -1,9 +1,12 @@
 export type AppMode = 'playlist' | 'library' | 'discover'
 
+export type LibrarySort = 'forgotten' | 'shuffle'
+
 export type SwipeSession = {
   mode: AppMode
   playlistId?: string
   playlistName?: string
+  librarySort?: LibrarySort
 }
 
 export type SwipeTrack = {

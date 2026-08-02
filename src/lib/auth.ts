@@ -10,6 +10,7 @@ const SCOPES = [
   'playlist-modify-public',
   'playlist-modify-private',
   'user-top-read',
+  'user-read-recently-played',
   'streaming',
   'user-read-playback-state',
   'user-modify-playback-state',

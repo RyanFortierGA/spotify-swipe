@@ -1,7 +1,8 @@
-import type { AppMode } from '../types'
+import { useState } from 'react'
+import type { AppMode, LibrarySort } from '../types'
 
 type Props = {
-  onSelect: (mode: AppMode) => void
+  onSelect: (mode: AppMode, opts?: { librarySort?: LibrarySort }) => void
   userName: string | null
   isPremium: boolean
 }
@@ -28,7 +29,28 @@ const MODES: Array<{
   },
 ]
 
+const LIBRARY_SORTS: Array<{
+  id: LibrarySort
+  title: string
+  blurb: string
+  default?: boolean
+}> = [
+  {
+    id: 'forgotten',
+    title: 'Forgotten first',
+    blurb: 'Songs you liked but barely play anymore — best for cleanup.',
+    default: true,
+  },
+  {
+    id: 'shuffle',
+    title: 'Shuffle',
+    blurb: 'Random mix from across your liked songs.',
+  },
+]
+
 export function ModeSelect({ onSelect, userName, isPremium }: Props) {
+  const [libraryOpen, setLibraryOpen] = useState(false)
+
   return (
     <section className="mode-select">
       <header className="mode-header">
@@ -41,16 +63,52 @@ export function ModeSelect({ onSelect, userName, isPremium }: Props) {
         )}
       </header>
 
-      <ul className="mode-list">
-        {MODES.map((mode) => (
-          <li key={mode.id}>
-            <button type="button" className="mode-card" onClick={() => onSelect(mode.id)}>
-              <span className="mode-title">{mode.title}</span>
-              <span className="mode-blurb">{mode.blurb}</span>
-            </button>
-          </li>
-        ))}
-      </ul>
+      {!libraryOpen ? (
+        <ul className="mode-list">
+          {MODES.map((mode) => (
+            <li key={mode.id}>
+              <button
+                type="button"
+                className="mode-card"
+                onClick={() => {
+                  if (mode.id === 'library') setLibraryOpen(true)
+                  else onSelect(mode.id)
+                }}
+              >
+                <span className="mode-title">{mode.title}</span>
+                <span className="mode-blurb">{mode.blurb}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="library-sort">
+          <button type="button" className="back" onClick={() => setLibraryOpen(false)}>
+            ← Modes
+          </button>
+          <header className="mode-header">
+            <h1>Liked songs</h1>
+            <p className="note">How should we order them?</p>
+          </header>
+          <ul className="mode-list">
+            {LIBRARY_SORTS.map((opt) => (
+              <li key={opt.id}>
+                <button
+                  type="button"
+                  className={`mode-card ${opt.default ? 'mode-card-default' : ''}`}
+                  onClick={() => onSelect('library', { librarySort: opt.id })}
+                >
+                  <span className="mode-title">
+                    {opt.title}
+                    {opt.default ? <em className="default-tag">Default</em> : null}
+                  </span>
+                  <span className="mode-blurb">{opt.blurb}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   )
 }
