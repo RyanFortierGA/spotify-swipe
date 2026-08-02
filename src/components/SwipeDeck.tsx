@@ -236,27 +236,39 @@ export function SwipeDeck({
 
     try {
       await onSwipe(swiped, direction)
+      // Only advance + record undo after Spotify action succeeds
       setUndo({ track: swiped, direction, index: undoIndex })
       if (undoTimer.current) window.clearTimeout(undoTimer.current)
-      undoTimer.current = window.setTimeout(() => setUndo(null), 8000)
-    } finally {
+      undoTimer.current = window.setTimeout(() => setUndo(null), 10000)
       x.set(0)
       setIndex((i) => i + 1)
+    } catch (e) {
+      // Snap back — keep the same card, don't touch undo
+      await animate(x, 0, { type: 'spring', stiffness: 400, damping: 28 })
+      setStatus(e instanceof Error ? e.message : 'Action failed')
+    } finally {
       setBusy(false)
     }
   }
 
   const handleUndo = async () => {
     if (!undo || busy) return
+    const snapshot = undo
     setBusy(true)
+    setUndo(null)
+    if (undoTimer.current) window.clearTimeout(undoTimer.current)
+
     try {
-      await onUndo(undo.track, undo.direction)
+      await onUndo(snapshot.track, snapshot.direction)
+      killAudio()
+      void pausePlayback().catch(() => undefined)
       x.set(0)
-      setIndex(undo.index)
-      setUndo(null)
-      if (undoTimer.current) window.clearTimeout(undoTimer.current)
+      setIndex(snapshot.index)
       setStatus('Undone — tap play')
+      setPlaying(false)
     } catch (e) {
+      // Put undo chip back if restore failed
+      setUndo(snapshot)
       setStatus(e instanceof Error ? e.message : 'Undo failed')
     } finally {
       setBusy(false)

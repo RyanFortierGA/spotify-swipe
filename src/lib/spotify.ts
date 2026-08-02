@@ -15,7 +15,7 @@ async function spotifyFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T
     Authorization: `Bearer ${token}`,
     ...(init?.headers as Record<string, string> | undefined),
   }
-  if (method !== 'GET' && method !== 'HEAD') {
+  if (method !== 'GET' && method !== 'HEAD' && init?.body != null) {
     headers['Content-Type'] = headers['Content-Type'] ?? 'application/json'
   }
 
@@ -98,6 +98,57 @@ type PlaylistTracksPage = {
   next: string | null
 }
 
+type SavedTracksPage = {
+  items: Array<{ track: SpotifyTrack }>
+  next: string | null
+  total?: number
+}
+
+export async function getLikedTracks(): Promise<SwipeTrack[]> {
+  // Probe total so we can start at a random offset (true shuffle feel)
+  const probe = await spotifyFetch<{
+    items: Array<{ track: SpotifyTrack }>
+    next: string | null
+    total: number
+  }>('/me/tracks?limit=1')
+  const total = probe.total ?? 0
+  const windowSize = Math.min(SESSION_TRACK_CAP, Math.max(total, 0))
+  const maxStart = Math.max(0, total - windowSize)
+  const start = maxStart > 0 ? Math.floor(Math.random() * (maxStart + 1)) : 0
+
+  const tracks: SwipeTrack[] = []
+  let path: string | null = `/me/tracks?limit=50&offset=${start}`
+  let pages = 0
+  const seen = new Set<string>()
+
+  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
+    if (seen.has(path)) break
+    seen.add(path)
+    pages += 1
+
+    const page = await spotifyFetch<SavedTracksPage>(path)
+    for (const item of page.items ?? []) {
+      if (item.track?.id) {
+        tracks.push(toSwipeTrack(item.track))
+        if (tracks.length >= SESSION_TRACK_CAP) break
+      }
+    }
+    path = nextPath(page.next)
+    // Don't wrap past our random window too far — stop if we've left the intended range
+    if (path && start > 0) {
+      try {
+        const u = new URL(path, 'https://api.spotify.com/v1')
+        const offset = Number(u.searchParams.get('offset') || 0)
+        if (offset >= start + SESSION_TRACK_CAP) break
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return shuffle(tracks)
+}
+
 export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[]> {
   const tracks: SwipeTrack[] = []
   let path: string | null =
@@ -120,36 +171,16 @@ export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[
     path = nextPath(page.next)
   }
 
-  return tracks
+  return shuffle(tracks)
 }
 
-type SavedTracksPage = {
-  items: Array<{ track: SpotifyTrack }>
-  next: string | null
-}
-
-export async function getLikedTracks(): Promise<SwipeTrack[]> {
-  const tracks: SwipeTrack[] = []
-  let path: string | null = '/me/tracks?limit=50'
-  let pages = 0
-  const seen = new Set<string>()
-
-  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
-    if (seen.has(path)) break
-    seen.add(path)
-    pages += 1
-
-    const page = await spotifyFetch<SavedTracksPage>(path)
-    for (const item of page.items ?? []) {
-      if (item.track?.id) {
-        tracks.push(toSwipeTrack(item.track))
-        if (tracks.length >= SESSION_TRACK_CAP) break
-      }
-    }
-    path = nextPath(page.next)
+function shuffle<T>(list: T[]): T[] {
+  const arr = [...list]
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
   }
-
-  return tracks
+  return arr
 }
 
 export async function removeFromPlaylist(playlistId: string, trackUris: string[]) {

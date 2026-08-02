@@ -104,14 +104,7 @@ export default function App() {
         list = await getDiscoverTracks(50, user?.country || 'US')
       }
 
-      // Shuffle playlist/library a bit so consecutive albums don't stack
-      if (next.mode !== 'discover') {
-        for (let i = list.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1))
-          ;[list[i], list[j]] = [list[j], list[i]]
-        }
-      }
-
+      // Shuffle already applied when fetching playlist/library
       setTracks(list)
       setScreen(list.length ? 'swipe' : 'done')
     } catch (e) {
@@ -168,14 +161,16 @@ export default function App() {
       return
     }
 
+    // Undo keep — visual only
     if (direction === 'right') {
       setStats((s) => ({ ...s, kept: Math.max(0, s.kept - 1) }))
       return
     }
 
-    // Restore a removed track
+    // Undo remove — put the song back
+    const uri = track.uri || `spotify:track:${track.id}`
     if (session.mode === 'playlist' && session.playlistId) {
-      await addToPlaylist(session.playlistId, [track.uri])
+      await addToPlaylist(session.playlistId, [uri])
     } else if (session.mode === 'library') {
       await saveToLibrary([track.id])
     }
