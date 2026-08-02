@@ -108,7 +108,16 @@ export default function App() {
       }
 
       setTracks(list)
-      setScreen(list.length ? 'swipe' : 'done')
+      if (!list.length) {
+        setError(
+          next.mode === 'discover'
+            ? 'No discover tracks found. Try Liked songs, or listen on Spotify more then retry.'
+            : 'No tracks found in that playlist.',
+        )
+        setScreen(next.mode === 'playlist' ? 'playlists' : 'modes')
+        return
+      }
+      setScreen('swipe')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load tracks')
       setScreen('modes')
@@ -245,8 +254,12 @@ export default function App() {
         />
       )}
 
-      {screen === 'playlists' && (
-        <PlaylistPicker onPick={onPickPlaylist} onBack={() => setScreen('modes')} />
+      {screen === 'playlists' && user && (
+        <PlaylistPicker
+          userId={user.id}
+          onPick={onPickPlaylist}
+          onBack={() => setScreen('modes')}
+        />
       )}
 
       {screen === 'loading' && (

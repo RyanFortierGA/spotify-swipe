@@ -30,7 +30,16 @@ async function spotifyFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T
 
   if (!res.ok) {
     const text = await res.text()
-    throw new Error(text || `Spotify API error ${res.status}`)
+    let message = text || `Spotify API error ${res.status}`
+    try {
+      const parsed = JSON.parse(text) as { error?: { message?: string; status?: number } }
+      if (parsed.error?.message) {
+        message = `${parsed.error.status ?? res.status}: ${parsed.error.message}`
+      }
+    } catch {
+      /* raw text */
+    }
+    throw new Error(message)
   }
 
   return res.json() as Promise<T>
@@ -70,7 +79,7 @@ export async function getMe(): Promise<SpotifyUser> {
   return spotifyFetch<SpotifyUser>('/me')
 }
 
-export async function getPlaylists(): Promise<SpotifyPlaylist[]> {
+export async function getPlaylists(userId?: string): Promise<SpotifyPlaylist[]> {
   const items: SpotifyPlaylist[] = []
   let path: string | null = '/me/playlists?limit=50'
   let pages = 0
@@ -90,12 +99,101 @@ export async function getPlaylists(): Promise<SpotifyPlaylist[]> {
     path = nextPath(page.next)
   }
 
-  return items.filter((p): p is SpotifyPlaylist => Boolean(p?.id))
+  const all = items.filter((p): p is SpotifyPlaylist => Boolean(p?.id))
+  if (!userId) return all
+  // Only playlists you can edit (own or collaborative)
+  return all.filter(
+    (p) => p.owner?.id === userId || p.collaborative,
+  )
 }
 
-type PlaylistTracksPage = {
-  items: Array<{ track: SpotifyTrack | null; uri?: string }>
-  next: string | null
+export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[]> {
+  const tracks: SwipeTrack[] = []
+  const endpoints = [
+    `/playlists/${playlistId}/items?limit=50`,
+    `/playlists/${playlistId}/tracks?limit=50`,
+  ]
+
+  let pageItems: Array<Record<string, unknown>> = []
+  let next: string | null = null
+  let startPath: string | null = null
+
+  for (const endpoint of endpoints) {
+    try {
+      const page = await spotifyFetch<{
+        items: Array<Record<string, unknown>>
+        next: string | null
+      }>(endpoint)
+      pageItems = page.items ?? []
+      next = page.next
+      startPath = endpoint
+      break
+    } catch {
+      /* try next endpoint */
+    }
+  }
+
+  if (!startPath) {
+    throw new Error('Could not load this playlist (Spotify blocked playlist items for this app/playlist).')
+  }
+
+  const consume = (rows: Array<Record<string, unknown>>) => {
+    let extracted = 0
+    for (const row of rows) {
+      const track = extractPlaylistTrack(row)
+      if (track?.id) {
+        const uri =
+          (typeof row.uri === 'string' && row.uri) ||
+          track.uri ||
+          `spotify:track:${track.id}`
+        tracks.push(toSwipeTrack(track, uri))
+        extracted += 1
+        if (tracks.length >= SESSION_TRACK_CAP) break
+      }
+    }
+    if (rows.length > 0 && extracted === 0) {
+      throw new Error(
+        'Playlist loaded but track format was unexpected. Try another playlist you own.',
+      )
+    }
+  }
+
+  consume(pageItems)
+
+  let path = nextPath(next)
+  let pages = 1
+  const seen = new Set<string>([startPath])
+
+  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
+    if (seen.has(path)) break
+    seen.add(path)
+    pages += 1
+    const page = await spotifyFetch<{
+      items: Array<Record<string, unknown>>
+      next: string | null
+    }>(path)
+    consume(page.items ?? [])
+    path = nextPath(page.next)
+  }
+
+  return shuffle(tracks)
+}
+
+function extractPlaylistTrack(row: Record<string, unknown>): SpotifyTrack | null {
+  const direct = row.track ?? row.item
+  if (direct && typeof direct === 'object') {
+    const obj = direct as Record<string, unknown>
+    if (obj.type === 'episode' || obj.type === 'unknown') return null
+    if (typeof obj.id === 'string' && obj.name) return direct as SpotifyTrack
+    // Nested wrappers some API versions use
+    if (obj.track && typeof obj.track === 'object') {
+      return extractPlaylistTrack(obj as Record<string, unknown>)
+    }
+  }
+  if (typeof row.id === 'string' && row.name && row.artists) {
+    return row as unknown as SpotifyTrack
+  }
+  return null
 }
 
 export async function getLikedTracks(
@@ -228,31 +326,6 @@ async function fetchLikedWindow(
   return rows
 }
 
-export async function getPlaylistTracks(playlistId: string): Promise<SwipeTrack[]> {
-  const tracks: SwipeTrack[] = []
-  let path: string | null =
-    `/playlists/${playlistId}/tracks?limit=50&fields=next,items(uri,track(id,uri,name,duration_ms,preview_url,artists(id,name),album(id,name,images),external_ids))`
-  let pages = 0
-  const seen = new Set<string>()
-
-  while (path && pages < MAX_PAGES && tracks.length < SESSION_TRACK_CAP) {
-    if (seen.has(path)) break
-    seen.add(path)
-    pages += 1
-
-    const page = await spotifyFetch<PlaylistTracksPage>(path)
-    for (const item of page.items ?? []) {
-      if (item.track?.id) {
-        tracks.push(toSwipeTrack(item.track, item.uri))
-        if (tracks.length >= SESSION_TRACK_CAP) break
-      }
-    }
-    path = nextPath(page.next)
-  }
-
-  return shuffle(tracks)
-}
-
 function shuffle<T>(list: T[]): T[] {
   const arr = [...list]
   for (let i = arr.length - 1; i > 0; i--) {
@@ -263,75 +336,140 @@ function shuffle<T>(list: T[]): T[] {
 }
 
 export async function removeFromPlaylist(playlistId: string, trackUris: string[]) {
-  await spotifyFetch(`/playlists/${playlistId}/tracks`, {
-    method: 'DELETE',
-    body: JSON.stringify({ tracks: trackUris.map((uri) => ({ uri })) }),
-  })
+  const items = trackUris.map((uri) => ({ uri }))
+  // Feb 2026+: /items (tracks param renamed). Fall back to legacy /tracks.
+  try {
+    await spotifyFetch(`/playlists/${playlistId}/items`, {
+      method: 'DELETE',
+      body: JSON.stringify({ items }),
+    })
+  } catch {
+    await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+      method: 'DELETE',
+      body: JSON.stringify({ tracks: items }),
+    })
+  }
 }
 
+function toTrackUris(trackIds: string[]): string[] {
+  return trackIds.map((id) => (id.startsWith('spotify:') ? id : `spotify:track:${id}`))
+}
+
+/** Feb 2026: DELETE /me/tracks → DELETE /me/library?uris=... */
 export async function removeFromLibrary(trackIds: string[]) {
-  for (let i = 0; i < trackIds.length; i += 50) {
-    const chunk = trackIds.slice(i, i + 50)
-    await spotifyFetch(`/me/tracks?ids=${chunk.join(',')}`, { method: 'DELETE' })
+  for (let i = 0; i < trackIds.length; i += 40) {
+    const uris = toTrackUris(trackIds.slice(i, i + 40))
+    const q = uris.map(encodeURIComponent).join(',')
+    await spotifyFetch(`/me/library?uris=${q}`, { method: 'DELETE' })
   }
 }
 
+/** Feb 2026: PUT /me/tracks → PUT /me/library */
 export async function saveToLibrary(trackIds: string[]) {
-  for (let i = 0; i < trackIds.length; i += 50) {
-    const chunk = trackIds.slice(i, i + 50)
-    await spotifyFetch(`/me/tracks?ids=${chunk.join(',')}`, { method: 'PUT' })
+  for (let i = 0; i < trackIds.length; i += 40) {
+    const uris = toTrackUris(trackIds.slice(i, i + 40))
+    const q = uris.map(encodeURIComponent).join(',')
+    try {
+      await spotifyFetch(`/me/library?uris=${q}`, { method: 'PUT' })
+    } catch {
+      await spotifyFetch(`/me/library`, {
+        method: 'PUT',
+        body: JSON.stringify({ uris }),
+      })
+    }
   }
 }
 
+/** Feb 2026: GET /me/tracks/contains → GET /me/library/contains */
 export async function checkSaved(trackIds: string[]): Promise<boolean[]> {
   const results: boolean[] = []
-  for (let i = 0; i < trackIds.length; i += 50) {
-    const chunk = trackIds.slice(i, i + 50)
-    const flags = await spotifyFetch<boolean[]>(`/me/tracks/contains?ids=${chunk.join(',')}`)
-    results.push(...flags)
+  for (let i = 0; i < trackIds.length; i += 40) {
+    const uris = toTrackUris(trackIds.slice(i, i + 40))
+    const q = uris.map(encodeURIComponent).join(',')
+    try {
+      const flags = await spotifyFetch<boolean[]>(`/me/library/contains?uris=${q}`)
+      results.push(...flags)
+    } catch {
+      // Legacy fallback for extended-quota apps
+      const ids = trackIds.slice(i, i + 40)
+      const flags = await spotifyFetch<boolean[]>(`/me/tracks/contains?ids=${ids.join(',')}`)
+      results.push(...flags)
+    }
   }
   return results
 }
 
-type TopArtistsPage = {
-  items: Array<{ id: string; name: string }>
-}
-
-export async function getDiscoverTracks(limit = 40, market = 'US'): Promise<SwipeTrack[]> {
-  const top = await spotifyFetch<TopArtistsPage>('/me/top/artists?limit=8&time_range=medium_term')
-  const artists = top.items
+export async function getDiscoverTracks(limit = 40, _market = 'US'): Promise<SwipeTrack[]> {
   const candidates = new Map<string, SwipeTrack>()
 
-  if (artists.length === 0) return []
-
-  // Top tracks only — keep discover fast (no album fan-out)
-  await Promise.all(
-    artists.map(async (artist) => {
-      try {
-        const data = await spotifyFetch<{ tracks: SpotifyTrack[] }>(
-          `/artists/${artist.id}/top-tracks?market=${encodeURIComponent(market)}`,
-        )
-        for (const track of data.tracks ?? []) {
-          if (track?.id) candidates.set(track.id, toSwipeTrack(track))
-        }
-      } catch {
-        /* skip artist */
+  // 1) Your top tracks as a baseline pool
+  for (const range of ['medium_term', 'short_term', 'long_term'] as const) {
+    try {
+      const data = await spotifyFetch<{ items: SpotifyTrack[] }>(
+        `/me/top/tracks?limit=50&time_range=${range}`,
+      )
+      for (const track of data.items ?? []) {
+        if (track?.id) candidates.set(track.id, toSwipeTrack(track))
       }
-    }),
-  )
-
-  const ids = [...candidates.keys()]
-  if (ids.length === 0) return []
-
-  const saved = await checkSaved(ids)
-  const fresh = ids.filter((_, i) => !saved[i]).map((id) => candidates.get(id)!)
-
-  for (let i = fresh.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[fresh[i], fresh[j]] = [fresh[j], fresh[i]]
+    } catch {
+      /* continue */
+    }
   }
 
-  return fresh.slice(0, limit)
+  // 2) Search for tracks by your top artists (top-tracks endpoint is gone)
+  try {
+    const artists = await spotifyFetch<{ items: Array<{ id: string; name: string }> }>(
+      '/me/top/artists?limit=8&time_range=medium_term',
+    )
+    await Promise.all(
+      (artists.items ?? []).map(async (artist) => {
+        try {
+          const q = encodeURIComponent(`artist:"${artist.name}"`)
+          const data = await spotifyFetch<{
+            tracks?: { items?: SpotifyTrack[] }
+          }>(`/search?q=${q}&type=track&limit=10`)
+          for (const track of data.tracks?.items ?? []) {
+            if (track?.id) candidates.set(track.id, toSwipeTrack(track))
+          }
+        } catch {
+          /* skip artist */
+        }
+      }),
+    )
+  } catch {
+    /* no top artists */
+  }
+
+  // 3) Fallback: pull from liked songs if still empty
+  if (candidates.size === 0) {
+    try {
+      const liked = await getLikedTracksShuffled()
+      for (const t of liked.slice(0, limit)) candidates.set(t.id, t)
+    } catch {
+      /* give up */
+    }
+  }
+
+  const ids = [...candidates.keys()]
+  if (ids.length === 0) {
+    throw new Error(
+      'No discover tracks found. Listen on Spotify a bit, then try again — or use Liked songs.',
+    )
+  }
+
+  let fresh = ids.map((id) => candidates.get(id)!)
+  try {
+    const saved = await checkSaved(ids)
+    const filtered = ids.filter((_, i) => !saved[i]).map((id) => candidates.get(id)!)
+    // Only apply filter if it doesn't wipe the whole pool
+    if (filtered.length >= Math.min(10, ids.length)) {
+      fresh = filtered
+    }
+  } catch {
+    /* keep unfiltered */
+  }
+
+  return shuffle(fresh).slice(0, limit)
 }
 
 /** Resolve a playable 30s preview from Spotify, Deezer, or Apple */
@@ -456,8 +594,15 @@ export async function resumePlayback(deviceId?: string | null) {
 }
 
 export async function addToPlaylist(playlistId: string, trackUris: string[]) {
-  await spotifyFetch(`/playlists/${playlistId}/tracks`, {
-    method: 'POST',
-    body: JSON.stringify({ uris: trackUris }),
-  })
+  try {
+    await spotifyFetch(`/playlists/${playlistId}/items`, {
+      method: 'POST',
+      body: JSON.stringify({ uris: trackUris }),
+    })
+  } catch {
+    await spotifyFetch(`/playlists/${playlistId}/tracks`, {
+      method: 'POST',
+      body: JSON.stringify({ uris: trackUris }),
+    })
+  }
 }
