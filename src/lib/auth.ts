@@ -25,9 +25,11 @@ type TokenBundle = {
   expiresAt: number
 }
 
-/** Always match the host you're on — must equal the Spotify redirect URI exactly */
+/** Always match the host you're on — must equal the Spotify redirect URI exactly.
+ *  Use `/` (not `/callback`) so hosts without SPA rewrite still serve index.html.
+ */
 export function getRedirectUri(): string {
-  return `${window.location.origin}/callback`
+  return `${window.location.origin}/`
 }
 
 function base64UrlEncode(buffer: ArrayBuffer): string {
